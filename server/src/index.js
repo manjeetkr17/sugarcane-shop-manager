@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import express from 'express';
+import 'express-async-errors'; // forward errors thrown in async route handlers to errorHandler
 import cors from 'cors';
 import morgan from 'morgan';
 import { connectDB } from './config/db.js';

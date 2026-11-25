@@ -63,9 +63,19 @@ const expenseSchema = new Schema({
   spentAt: { type: Date, default: Date.now }
 }, { timestamps: true });
 
+export const INVESTMENT_CATEGORIES = ['Juice machine', 'Refrigerator / freezer', 'Furniture & fixtures', 'Utensils & equipment', 'Shop setup / renovation', 'Rent deposit / advance', 'Other'];
+const investmentSchema = new Schema({
+  title: { type: String, required: true, trim: true },
+  category: { type: String, enum: INVESTMENT_CATEGORIES, default: 'Other' },
+  amount: { type: Number, required: true, min: 0 },
+  investedAt: { type: Date, default: Date.now },
+  note: String
+}, { timestamps: true });
+
 export const Ingredient = model('Ingredient', ingredientSchema);
 export const Flavour = model('Flavour', flavourSchema);
 export const Sale = model('Sale', saleSchema);
 export const StockMovement = model('StockMovement', movementSchema);
 export const Purchase = model('Purchase', purchaseSchema);
 export const Expense = model('Expense', expenseSchema);
+export const Investment = model('Investment', investmentSchema);

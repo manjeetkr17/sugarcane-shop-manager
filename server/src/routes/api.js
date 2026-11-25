@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import mongoose from 'mongoose';
-import { Ingredient, Flavour, Sale, StockMovement, Purchase, Expense } from '../models/index.js';
+import { Ingredient, Flavour, Sale, StockMovement, Purchase, Expense, Investment, INVESTMENT_CATEGORIES } from '../models/index.js';
 
 const router = Router();
 const num = (v, label) => {
@@ -126,5 +126,134 @@ router.get('/analytics', async (req,res) => {
   const ingredientUsage={};
   movements.filter(m=>m.type==='Sale').forEach(m=>ingredientUsage[m.ingredientName]=(ingredientUsage[m.ingredientName]||0)-m.quantity);
   res.json({flavours:Object.values(flavourMap).sort((a,b)=>b.revenue-a.revenue),ingredientUsage:Object.entries(ingredientUsage).map(([name,quantity])=>({name,quantity})),totalRevenue,totalIngredientCost:totalCost,grossProfit:totalRevenue-totalCost,totalExpenses,netResult:totalRevenue-totalCost-totalExpenses,stock:ingredients,movements});
+});
+// Parse a YYYY-MM-DD string as local midnight.
+const parseDay = (v, label) => {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(v || ''));
+  const d = m && new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+  if (!d || d.getMonth() !== Number(m[2]) - 1) throw Object.assign(new Error(`${label} must be a valid date (YYYY-MM-DD)`), { status: 400 });
+  return d;
+};
+const dayKey = d => `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+const monthKey = d => `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}`;
+
+// Sales report over an inclusive date range: /reports/sales?from=2026-11-01&to=2026-11-30
+router.get('/reports/sales', async (req,res) => {
+  const from = parseDay(req.query.from, 'From date');
+  const toDay = parseDay(req.query.to, 'To date');
+  if (toDay < from) throw Object.assign(new Error('To date must be on or after From date'), { status: 400 });
+  const to = new Date(toDay); to.setDate(to.getDate() + 1); // exclusive upper bound
+  const days = Math.round((to - from) / 86400000);
+  if (days > 366 * 3) throw Object.assign(new Error('Date range cannot exceed 3 years'), { status: 400 });
+
+  const [sales, expenses] = await Promise.all([
+    Sale.find({ soldAt: { $gte: from, $lt: to } }).sort({ soldAt: -1 }),
+    Expense.find({ spentAt: { $gte: from, $lt: to } })
+  ]);
+
+  // Daily buckets for ranges up to ~2 months, monthly buckets beyond that.
+  const groupBy = days <= 62 ? 'day' : 'month';
+  const keyOf = groupBy === 'day' ? dayKey : monthKey;
+  const buckets = new Map();
+  for (const d = new Date(from); d < to; groupBy === 'day' ? d.setDate(d.getDate() + 1) : d.setMonth(d.getMonth() + 1, 1)) {
+    const label = groupBy === 'day'
+      ? d.toLocaleDateString('en-IN', { day: '2-digit', month: 'short' })
+      : d.toLocaleDateString('en-IN', { month: 'short', year: 'numeric' });
+    buckets.set(keyOf(d), { key: keyOf(d), label, revenue: 0, orders: 0, cups: 0, ingredientCost: 0, expenses: 0 });
+  }
+
+  const flavourMap = {}, paymentMap = {};
+  let revenue = 0, ingredientCost = 0, cups = 0;
+  for (const s of sales) {
+    const b = buckets.get(keyOf(s.soldAt));
+    const qty = s.items.reduce((a, i) => a + i.quantity, 0);
+    revenue += s.total; ingredientCost += s.totalIngredientCost || 0; cups += qty;
+    if (b) { b.revenue += s.total; b.orders += 1; b.cups += qty; b.ingredientCost += s.totalIngredientCost || 0; }
+    const p = paymentMap[s.paymentMethod] ||= { method: s.paymentMethod, orders: 0, revenue: 0 };
+    p.orders += 1; p.revenue += s.total;
+    for (const i of s.items) {
+      const f = flavourMap[i.flavourName] ||= { name: i.flavourName, quantity: 0, revenue: 0, ingredientCost: 0 };
+      f.quantity += i.quantity; f.revenue += i.lineTotal; f.ingredientCost += i.ingredientCost || 0;
+    }
+  }
+  let totalExpenses = 0;
+  for (const e of expenses) {
+    totalExpenses += e.amount;
+    const b = buckets.get(keyOf(e.spentAt));
+    if (b) b.expenses += e.amount;
+  }
+
+  const series = [...buckets.values()];
+  const activeDays = groupBy === 'day' ? series.filter(b => b.orders).length : new Set(sales.map(s => dayKey(s.soldAt))).size;
+  const best = series.reduce((a, b) => (b.revenue > (a?.revenue || 0) ? b : a), null);
+  res.json({
+    from: dayKey(from), to: dayKey(toDay), days, groupBy,
+    summary: {
+      revenue, orders: sales.length, cups, ingredientCost,
+      grossProfit: revenue - ingredientCost, expenses: totalExpenses,
+      netResult: revenue - ingredientCost - totalExpenses,
+      averageOrder: sales.length ? revenue / sales.length : 0,
+      averagePerDay: revenue / days, activeDays,
+      bestPeriod: best ? { label: best.label, revenue: best.revenue } : null
+    },
+    series,
+    flavours: Object.values(flavourMap).sort((a, b) => b.revenue - a.revenue),
+    payments: Object.values(paymentMap).sort((a, b) => b.revenue - a.revenue),
+    sales: sales.slice(0, 500)
+  });
+});
+// ---- Investments (one-time setup spending) and payback tracking ----
+const investmentData = body => {
+  const title = String(body.title || '').trim();
+  if (!title) throw Object.assign(new Error('Title is required'), { status: 400 });
+  if (body.category && !INVESTMENT_CATEGORIES.includes(body.category)) throw Object.assign(new Error('Unknown investment category'), { status: 400 });
+  const amount = num(body.amount, 'Amount');
+  if (amount <= 0) throw Object.assign(new Error('Amount must be greater than zero'), { status: 400 });
+  return { title, category: body.category || 'Other', amount, investedAt: body.investedAt ? parseDay(body.investedAt, 'Date') : new Date(), note: body.note || '' };
+};
+router.get('/investments/categories', (req,res) => res.json(INVESTMENT_CATEGORIES));
+router.get('/investments', async (req,res) => res.json(await Investment.find().sort({ investedAt: -1, createdAt: -1 })));
+router.post('/investments', async (req,res) => res.status(201).json(await Investment.create(investmentData(req.body))));
+router.put('/investments/:id', async (req,res) => {
+  const item = await Investment.findByIdAndUpdate(req.params.id, investmentData(req.body), { new: true, runValidators: true });
+  if (!item) throw Object.assign(new Error('Investment not found'), { status: 404 });
+  res.json(item);
+});
+router.delete('/investments/:id', async (req,res) => {
+  const item = await Investment.findByIdAndDelete(req.params.id);
+  if (!item) throw Object.assign(new Error('Investment not found'), { status: 404 });
+  res.json({ success: true });
+});
+
+// Payback: all-time net profit (revenue - ingredient cost - expenses) vs total invested.
+router.get('/investments/summary', async (req,res) => {
+  const [investments, sales, expenses] = await Promise.all([Investment.find(), Sale.find({}, { total: 1, totalIngredientCost: 1, soldAt: 1 }), Expense.find({}, { amount: 1 })]);
+  const totalInvested = investments.reduce((a, i) => a + i.amount, 0);
+  const revenue = sales.reduce((a, s) => a + s.total, 0);
+  const ingredientCost = sales.reduce((a, s) => a + (s.totalIngredientCost || 0), 0);
+  const totalExpenses = expenses.reduce((a, e) => a + e.amount, 0);
+  const netProfit = revenue - ingredientCost - totalExpenses;
+  const recovered = Math.max(0, Math.min(netProfit, totalInvested));
+  const remaining = Math.max(0, totalInvested - netProfit);
+
+  // Average net profit per day since the first sale, used for the break-even estimate.
+  const firstSale = sales.reduce((a, s) => (!a || s.soldAt < a ? s.soldAt : a), null);
+  const daysTrading = firstSale ? Math.max(1, Math.ceil((todayStart() - new Date(firstSale).setHours(0,0,0,0)) / 86400000) + 1) : 0;
+  const netPerDay = daysTrading ? netProfit / daysTrading : 0;
+  let breakEven = null;
+  if (totalInvested > 0 && remaining === 0) breakEven = { status: 'recovered' };
+  else if (totalInvested > 0 && netPerDay > 0) {
+    const daysLeft = Math.ceil(remaining / netPerDay), date = todayStart(); date.setDate(date.getDate() + daysLeft);
+    breakEven = { status: 'estimated', daysLeft, date: dayKey(date) };
+  } else if (totalInvested > 0) breakEven = { status: daysTrading ? 'not-profitable' : 'no-sales' };
+
+  const byCategory = {};
+  investments.forEach(i => byCategory[i.category] = (byCategory[i.category] || 0) + i.amount);
+  res.json({
+    totalInvested, count: investments.length, revenue, ingredientCost, totalExpenses, netProfit,
+    recovered, remaining, recoveredPercent: totalInvested ? (recovered / totalInvested) * 100 : 0,
+    daysTrading, netPerDay, netPerMonth: netPerDay * 30, breakEven,
+    byCategory: Object.entries(byCategory).map(([category, amount]) => ({ category, amount })).sort((a, b) => b.amount - a.amount)
+  });
 });
 export default router;

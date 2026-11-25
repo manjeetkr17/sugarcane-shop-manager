@@ -12,6 +12,8 @@ A localhost-ready MVP for managing a sugarcane juice shop. It includes a React d
 - Expenses: record operating expenses.
 - Stock adjustments and wastage: keep an auditable stock movement history.
 - Analytics: sales by flavour, ingredient usage, estimated gross profit, and daily sales.
+- Sales report: revenue, orders, profit, flavour and payment-method breakdowns for any month or custom date range, with daily or monthly charts.
+- Investments: record one-time setup spending (machine, freezer, furniture, rent deposit, etc.) and track how much has been earned back, with a break-even estimate.
 - Low-stock alerts based on reorder levels.
 - Seed data for a quick first run.
 
@@ -21,6 +23,7 @@ A localhost-ready MVP for managing a sugarcane juice shop. It includes a React d
 - Backend: Node.js + Express
 - Database: MongoDB + Mongoose
 - Charts: Recharts
+- Async error handling: `express-async-errors` (errors thrown in async route handlers are returned as JSON with the correct status code)
 
 ## Requirements
 
@@ -85,6 +88,8 @@ sugarcane-shop/
         ├── api.js
         ├── main.jsx
         ├── App.jsx
+        ├── SalesReport.jsx
+        ├── Investments.jsx
         └── styles.css
 ```
 
@@ -107,6 +112,33 @@ Open **New Sale**, add one or more flavours and quantities, then save. The backe
 ### Record a purchase
 
 Open **Purchases**, choose an ingredient, enter quantity and total cost. Stock is increased and a purchase movement is recorded.
+
+### View sales over a period
+
+Open **Sales Report**. Choose a period in one of three ways:
+
+- **Quick buttons:** Today, Last 7 days, Last 30 days, This month (default), Last month, This year.
+- **Select month:** pick any month to see that whole month.
+- **Custom range:** set From and To dates and click **Apply**. Both dates are included.
+
+The report shows summary cards (revenue, average per day, orders, drinks sold, active days, average order, gross profit and net after expenses), a revenue chart, flavour performance, payment methods, a per-day or per-month breakdown with totals, and the list of sales in the period (latest 500).
+
+Ranges of up to 62 days are grouped by day; longer ranges are grouped by month. The maximum range is 3 years. Dates use the server's local time zone.
+
+### Track investments and payback
+
+Open **Investments** and add each one-time cost of setting up the shop: title, category, amount, date and an optional note. Categories are Juice machine, Refrigerator / freezer, Furniture & fixtures, Utensils & equipment, Shop setup / renovation, Rent deposit / advance, and Other. Entries can be edited or deleted from the table.
+
+The page shows:
+
+- **Total invested**, **recovered so far**, **still to recover**, and a **break-even** estimate.
+- A payback progress bar and a breakdown by category.
+
+What counts where:
+
+- **Investments:** one-time costs, such as a machine, a freezer or a rent deposit.
+- **Expenses** (Purchases → Record expense): recurring costs, such as monthly rent, electricity and wages.
+- **Purchases:** ingredient stock, including opening stock. Its cost is already counted through each sale's ingredient cost, so don't add it as an investment too.
 
 ### Record wastage or correction
 
@@ -154,6 +186,23 @@ Base URL: `http://localhost:5000/api`
 | POST | `/purchases` | Add purchase |
 | GET/POST | `/expenses` | List/create expenses |
 | GET | `/analytics` | Analytics data |
+| GET | `/reports/sales?from=YYYY-MM-DD&to=YYYY-MM-DD` | Sales report for an inclusive date range |
+| GET/POST | `/investments` | List/create investments |
+| PUT/DELETE | `/investments/:id` | Update/delete an investment |
+| GET | `/investments/categories` | Allowed investment categories |
+| GET | `/investments/summary` | Total invested, amount recovered, break-even estimate, category breakdown |
+
+### Sales report response
+
+`GET /reports/sales?from=2026-11-01&to=2026-11-30` returns:
+
+- `from`, `to`, `days`, `groupBy` (`day` for ranges up to 62 days, otherwise `month`)
+- `summary`: `revenue`, `orders`, `cups`, `ingredientCost`, `grossProfit`, `expenses`, `netResult`, `averageOrder`, `averagePerDay`, `activeDays`, `bestPeriod`
+- `series`: one entry per day or month with `label`, `revenue`, `orders`, `cups`, `ingredientCost`, `expenses`
+- `flavours`, `payments`: breakdowns sorted by revenue
+- `sales`: up to 500 most recent sales in the range
+
+Invalid dates, a To date before the From date, or a range over 3 years return `400` with a `message`.
 
 ## Business logic and assumptions
 
@@ -162,6 +211,9 @@ Base URL: `http://localhost:5000/api`
 - Estimated ingredient cost uses each ingredient's `unitCost` at sale time. This is a practical MVP estimate, not a full weighted-average costing ledger.
 - Gross profit = sales revenue minus estimated recipe ingredient cost.
 - Net operating result = gross profit minus recorded expenses.
+- Investment recovered = all-time net operating result, capped at the total invested. Still to recover = total invested minus net operating result.
+- Break-even estimate = still to recover ÷ average net operating result per day, where the average is taken over the days since the first sale (including today). It is shown only while that average is positive, and it becomes more reliable after a few weeks of trading.
+- Investments are not depreciated and do not affect gross profit or the sales report.
 - Taxes, GST invoicing, refunds, discounts, supplier credit, staff roles, barcode printing, and multi-outlet support are not included in this MVP.
 - This is a single-shop local application with no login. Do not expose it to the public internet without adding authentication, authorization, validation hardening, backups, and HTTPS.
 
